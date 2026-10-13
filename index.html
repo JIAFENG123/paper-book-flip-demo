@@ -1,0 +1,1668 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Paper Design 3D 翻书卷曲效果还原 (WebGL & Three.js)</title>
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+    body {
+      background-color: #F6F6F3;
+      color: #222222;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      overflow: hidden;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+    header {
+      padding: 12px 28px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      border-bottom: 1px solid #CFDFF5;
+      background: #F6F6F3;
+      z-index: 10;
+      flex-shrink: 0;
+    }
+    .brand {
+      font-weight: 600;
+      font-size: 14px;
+      letter-spacing: -0.02em;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .badge {
+      font-size: 11px;
+      background: #4B8BF5;
+      color: white;
+      padding: 3px 8px;
+      border-radius: 4px;
+      font-weight: 500;
+    }
+    .controls {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      font-size: 13px;
+    }
+    .page-indicator {
+      font-size: 12px;
+      color: #222222;
+      font-weight: 600;
+      letter-spacing: 0.05em;
+      background: #EAEFF7;
+      padding: 6px 16px;
+      border-radius: 6px;
+      border: 1px solid #CFDFF5;
+      min-width: 150px;
+      text-align: center;
+    }
+    .btn {
+      background: #ffffff;
+      border: 1px solid #CFDFF5;
+      padding: 7px 18px;
+      border-radius: 6px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      font-family: inherit;
+      transition: all 0.15s ease;
+      box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .btn:hover:not(:disabled) {
+      border-color: #4B8BF5;
+      color: #2b70d4;
+      background: #FAFCFF;
+    }
+    .btn.primary {
+      background: #111111;
+      color: #F6F6F3;
+      border-color: #111111;
+    }
+    .btn.primary:hover:not(:disabled) {
+      background: #333333;
+      color: #ffffff;
+    }
+    .btn:disabled {
+      opacity: 0.35;
+      cursor: not-allowed;
+      border-color: #CFDFF5;
+      background: #F0F0EE;
+    }
+    #canvas-container {
+      flex: 1;
+      position: relative;
+      width: 100%;
+      height: 100%;
+      touch-action: none;
+      cursor: grab;
+      background-color: #F6F6F3;
+      background-image: radial-gradient(#D5E2F5 1.2px, transparent 1.2px);
+      background-size: 24px 24px;
+      overflow: hidden;
+    }
+    #canvas-container:active {
+      cursor: grabbing;
+    }
+    .tip {
+      position: absolute;
+      top: 16px;
+      left: 50%;
+      transform: translateX(-50%);
+      font-size: 12px;
+      color: #555555;
+      background: rgba(255, 255, 255, 0.94);
+      backdrop-filter: blur(8px);
+      border: 1px solid #CFDFF5;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.04);
+      padding: 6px 18px;
+      border-radius: 20px;
+      pointer-events: none;
+      z-index: 5;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      white-space: nowrap;
+    }
+  </style>
+  <!-- Three.js CDN -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <span>Paper.design / Mono 3D 翻书着色器</span>
+      <span class="badge">PRINT FIDELITY</span>
+    </div>
+    <div class="controls">
+      <div class="page-indicator" id="page-indicator">[ 封面 · 合书 ]</div>
+      <button class="btn" id="btn-prev" disabled>← 上一页</button>
+      <button class="btn primary" id="btn-next">翻开封面 →</button>
+    </div>
+  </header>
+
+  <div id="canvas-container">
+    <div class="tip">💡 点击书页边缘或拖拽翻页，可合上/翻开封面与封底，支持 [←] [→] 键</div>
+  </div>
+
+  <script>
+    // --- 页面常量定义 ---
+    const SHEET_ASPECT = 1.377;
+    const CANVAS_W = 1800;
+    const CANVAS_H = Math.round(CANVAS_W * SHEET_ASPECT); // 2478 px
+
+    const TOTAL_TEXTURES = 14;
+    const TOTAL_SPREADS = 8;
+    // Spread 0: 合书封面
+    // Spread 1: Page 01 - 02
+    // Spread 2: Page 03 - 04
+    // Spread 3: Page 05 - 06
+    // Spread 4: Page 07 - 08
+    // Spread 5: Page 09 - 10
+    // Spread 6: Page 11 - 12
+    // Spread 7: 合书封底
+
+    // --- 高清页面渲染 (浓郁纯黑、清晰大字、1:1 原生色彩) ---
+    function renderPageCanvas(index) {
+      const canvas = document.createElement('canvas');
+      canvas.width = CANVAS_W;
+      canvas.height = CANVAS_H;
+      const ctx = canvas.getContext('2d');
+      ctx.imageSmoothingEnabled = true;
+
+      // 1. 底色
+      ctx.fillStyle = '#F8F8F5';
+      ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+
+      // 2. 网格辅助线
+      ctx.strokeStyle = '#E7EDF6';
+      ctx.lineWidth = 1.5;
+      const step = 75;
+      for (let x = 0; x < CANVAS_W; x += step) {
+        ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, CANVAS_H); ctx.stroke();
+      }
+      for (let y = 0; y < CANVAS_H; y += step) {
+        ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(CANVAS_W, y); ctx.stroke();
+      }
+
+      // 3. 边框与微型对位十字标记
+      ctx.strokeStyle = '#D1DDEE';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(90, 90, CANVAS_W - 180, CANVAS_H - 180);
+
+      const drawCross = (cx, cy) => {
+        ctx.beginPath();
+        ctx.moveTo(cx - 14, cy); ctx.lineTo(cx + 14, cy);
+        ctx.moveTo(cx, cy - 14); ctx.lineTo(cx, cy + 14);
+        ctx.stroke();
+      };
+      drawCross(90, 90);
+      drawCross(CANVAS_W - 90, 90);
+      drawCross(90, CANVAS_H - 90);
+      drawCross(CANVAS_W - 90, CANVAS_H - 90);
+
+      // 4. 书脊微阴影渐变
+      const isLeft = (index % 2 === 1);
+      if (index !== 0 && index !== 13) {
+        const spineGradient = ctx.createLinearGradient(
+          isLeft ? CANVAS_W - 130 : 0, 0,
+          isLeft ? CANVAS_W : 130, 0
+        );
+        spineGradient.addColorStop(isLeft ? 0 : 1, 'rgba(0, 0, 0, 0)');
+        spineGradient.addColorStop(isLeft ? 1 : 0, 'rgba(0, 0, 0, 0.06)');
+        ctx.fillStyle = spineGradient;
+        ctx.fillRect(isLeft ? CANVAS_W - 130 : 0, 0, 130, CANVAS_H);
+      }
+
+      // 5. 页眉与顶栏
+      ctx.textBaseline = 'top';
+      ctx.fillStyle = '#0F0F11';
+      ctx.font = 'bold 30px monospace';
+      ctx.fillText('PAPER DESIGN // MONO VARIABLE SPECIMEN', 140, 125);
+      ctx.fillStyle = '#2B6CE6';
+      ctx.fillText('EDITION 2026', CANVAS_W - 380, 125);
+
+      // 6. 各页核心内容排版 (大字号、高饱和)
+      switch (index) {
+        case 0:  renderCoverFront(ctx); break;
+        case 1:  renderPageInsideCover(ctx); break;
+        case 2:  renderPageArchitecture(ctx); break;
+        case 3:  renderPageWeights(ctx); break;
+        case 4:  renderPageLigatures(ctx); break;
+        case 5:  renderPageShader(ctx); break;
+        case 6:  renderPageGlyphs(ctx); break;
+        case 7:  renderPageMetrics(ctx); break;
+        case 8:  renderPageMath(ctx); break;
+        case 9:  renderPageTui(ctx); break;
+        case 10: renderPageScripts(ctx); break;
+        case 11: renderPageVariables(ctx); break;
+        case 12: renderPageColophon(ctx); break;
+        case 13: renderCoverBack(ctx); break;
+      }
+
+      // 7. 页脚与页码
+      ctx.fillStyle = '#444444';
+      ctx.font = 'bold 28px monospace';
+      if (index >= 1 && index <= 12) {
+        const pageNumStr = `PAGE ${String(index).padStart(2, '0')}`;
+        if (isLeft) {
+          ctx.fillText(pageNumStr, 140, CANVAS_H - 150);
+          ctx.fillText('THE MONOSPACED SPECIMEN', CANVAS_W - 550, CANVAS_H - 150);
+        } else {
+          ctx.fillText('PAPER.DESIGN LABS', 140, CANVAS_H - 150);
+          ctx.fillText(pageNumStr, CANVAS_W - 280, CANVAS_H - 150);
+        }
+      }
+
+      return canvas;
+    }
+
+    // --- 各页内容 ---
+    function renderCoverFront(ctx) {
+      ctx.fillStyle = '#0F0F11';
+      ctx.font = 'bold 155px monospace';
+      ctx.fillText('PAPER', 140, 310);
+      ctx.fillStyle = '#2B6CE6';
+      ctx.fillText('MONO', 140, 475);
+
+      ctx.fillStyle = '#0F0F11';
+      ctx.font = 'bold 36px monospace';
+      ctx.fillText('A TECHNICAL VARIABLE CODE TYPEFACE', 140, 680);
+      ctx.font = '500 32px monospace';
+      ctx.fillStyle = '#333333';
+      ctx.fillText('ENGINEERED FOR HIGH DENSITY SCREENS & PRINT', 140, 735);
+
+      ctx.fillStyle = '#E1EDFB';
+      ctx.fillRect(140, 830, 530, 66);
+      ctx.fillStyle = '#1D53A6';
+      ctx.font = 'bold 28px monospace';
+      ctx.fillText('[ 100-900 WGHT / -12° SLNT ]', 165, 847);
+
+      ctx.fillStyle = '#0F0F11';
+      ctx.font = 'bold 34px monospace';
+      const lines = [
+        "Aa Bb Cc Dd Ee Ff Gg Hh Ii Jj Kk Ll Mm",
+        "Nn Oo Pp Qq Rr Ss Tt Uu Vv Ww Xx Yy Zz",
+        "0 1 2 3 4 5 6 7 8 9  ! @ # $ % ^ & *",
+        "-> => !== === && || <= >= </> /* */"
+      ];
+      lines.forEach((l, i) => ctx.fillText(l, 140, 980 + i * 65));
+
+      // 条形码
+      ctx.fillStyle = '#0F0F11';
+      let bx = 140;
+      for (let i = 0; i < 48; i++) {
+        const w = (i % 3 === 0) ? 10 : (i % 2 === 0 ? 5 : 3);
+        ctx.fillRect(bx, 1380, w, 110);
+        bx += w + 7;
+      }
+      ctx.font = 'bold 24px monospace';
+      ctx.fillStyle = '#555';
+      ctx.fillText('ISBN 978-0-PAPER-MONO-SPECIMEN-2026', 140, 1515);
+
+      // 参数框
+      ctx.strokeStyle = '#D1DDEE';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(140, 1630, CANVAS_W - 280, 290);
+      ctx.fillStyle = '#0F0F11';
+      ctx.font = 'bold 32px monospace';
+      ctx.fillText('CORE SYSTEM SPECIFICATIONS', 180, 1675);
+      ctx.font = 'bold 28px monospace';
+      ctx.fillStyle = '#444';
+      ctx.fillText('• EM-SQUARE: 1000 UPM          • TOTAL GLYPHS: 1,420', 180, 1740);
+      ctx.fillText('• ADVANCE: 600 UPM FIXED       • OPEN-TYPE FEATURES: calt, dlig', 180, 1795);
+      ctx.fillText('• RENDER TARGET: WEBGL SHADER  • RESOLUTION: 1800 × 2478 px', 180, 1850);
+    }
+
+    function renderPageInsideCover(ctx) {
+      ctx.fillStyle = '#0F0F11';
+      ctx.font = 'bold 64px monospace';
+      ctx.fillText('PREFACE & MANIFESTO', 140, 240);
+      ctx.fillStyle = '#2B6CE6';
+      ctx.font = 'bold 32px monospace';
+      ctx.fillText('THE PURPOSE OF MONOSPACE IN MODERN COMPUTING', 140, 320);
+
+      ctx.fillStyle = '#0F0F11';
+      ctx.font = '32px monospace';
+      const text = [
+        "In an era dominated by proportional typefaces, monospaced",
+        "typography preserves structural truth. Each glyph commands",
+        "an identical horizontal space, creating rhythmic columnarity",
+        "essential for terminal pipelines, code matrices, and diffs.",
+        "",
+        "Paper Mono was conceived at the intersection of Swiss style",
+        "information architecture and real-time GPU rendering.",
+        "",
+        "\"Precision is not the absence of emotion, but the clarity",
+        "of structure unburdened by decoration.\""
+      ];
+      text.forEach((l, i) => ctx.fillText(l, 140, 420 + i * 54));
+
+      ctx.fillStyle = '#F0F4FA';
+      ctx.fillRect(140, 1100, CANVAS_W - 280, 720);
+      ctx.strokeStyle = '#CFE0F5';
+      ctx.strokeRect(140, 1100, CANVAS_W - 280, 720);
+
+      ctx.fillStyle = '#0F0F11';
+      ctx.font = 'bold 36px monospace';
+      ctx.fillText('SPECIMEN NAVIGATION GUIDE', 180, 1150);
+
+      const toc = [
+        "01 / ARCHITECTURE & METRICS ................ PAGE 02",
+        "02 / WEIGHT SPECTRUM (100 - 900) .......... PAGE 03",
+        "03 / CODING LIGATURES ..................... PAGE 04",
+        "04 / SHADER PHYSICS SPECIMEN .............. PAGE 05",
+        "05 / COMPLETE GLYPH MATRIX ................ PAGE 06",
+        "06 / STRUCTURAL METRICS BLUEPRINT ......... PAGE 07",
+        "07 / MATHEMATICS & OPERATORS .............. PAGE 08",
+        "08 / BOX DRAWING & TERMINAL UI ............ PAGE 09",
+        "09 / WORLD SCRIPTS & CYRILLIC ............. PAGE 10",
+        "10 / VARIABLE AXES TEST ................... PAGE 11",
+        "11 / COLOPHON & CREDITS ................... PAGE 12"
+      ];
+      toc.forEach((item, idx) => {
+        ctx.fillStyle = '#222';
+        ctx.font = 'bold 28px monospace';
+        ctx.fillText(item, 180, 1225 + idx * 48);
+      });
+    }
+
+    function renderPageArchitecture(ctx) {
+      ctx.fillStyle = '#0F0F11';
+      ctx.font = 'bold 64px monospace';
+      ctx.fillText('01 / ARCHITECTURE', 140, 240);
+      ctx.fillStyle = '#2B6CE6';
+      ctx.font = 'bold 32px monospace';
+      ctx.fillText('OPTICAL BALANCE IN FIXED HORIZONTAL BOUNDS', 140, 320);
+
+      ctx.fillStyle = '#0F0F11';
+      ctx.font = '32px monospace';
+      const body = [
+        "Fitting 'M' and 'W' into the exact same horizontal box as 'I'",
+        "requires subtle optical adjustments: thinning diagonal joints",
+        "and opening interior counters.",
+        "",
+        "Key engineering features:",
+        "1. Dotted and slashed zero differentiation: [ 0 ] vs [ O ]",
+        "2. Heightened punctuation marks for swift terminal scanning",
+        "3. Curved lower tails on 'l' and 't' preventing collisions"
+      ];
+      body.forEach((l, i) => ctx.fillText(l, 140, 410 + i * 50));
+
+      ctx.strokeStyle = '#2B6CE6';
+      ctx.lineWidth = 3;
+      ctx.strokeRect(140, 1000, 720, 420);
+      ctx.strokeRect(900, 1000, 720, 420);
+
+      ctx.fillStyle = '#0F0F11';
+      ctx.font = 'bold 280px monospace';
+      ctx.fillText('M', 370, 1060);
+      ctx.fillText('I', 1190, 1060);
+
+      ctx.fillStyle = '#2B6CE6';
+      ctx.font = 'bold 26px monospace';
+      ctx.fillText('WIDTH: 600 UPM (OPTICAL INK-TRAP)', 200, 1450);
+      ctx.fillText('WIDTH: 600 UPM (EXTENDED SERIF)', 960, 1450);
+
+      ctx.strokeStyle = '#C2D6EE';
+      ctx.lineWidth = 2;
+      ctx.setLineDash([8, 8]);
+      ctx.beginPath();
+      ctx.moveTo(140, 1600); ctx.lineTo(CANVAS_W - 140, 1600);
+      ctx.moveTo(140, 1740); ctx.lineTo(CANVAS_W - 140, 1740);
+      ctx.moveTo(140, 1880); ctx.lineTo(CANVAS_W - 140, 1880);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      ctx.fillStyle = '#555';
+      ctx.font = 'bold 24px monospace';
+      ctx.fillText('ASCENDER LINE (+780)', 140, 1565);
+      ctx.fillText('X-HEIGHT LINE (+520)', 140, 1705);
+      ctx.fillText('BASELINE (0)', 140, 1845);
+    }
+
+    function renderPageWeights(ctx) {
+      ctx.fillStyle = '#0F0F11';
+      ctx.font = 'bold 64px monospace';
+      ctx.fillText('02 / WEIGHT SPECTRUM', 140, 240);
+      ctx.fillStyle = '#2B6CE6';
+      ctx.font = 'bold 32px monospace';
+      ctx.fillText('VARIABLE WEIGHT AXIS [wght 100 .. 900]', 140, 320);
+
+      const weights = [
+        { label: '100 THIN', sample: 'import { createPaperEngine } from "paper";', font: '100 38px monospace' },
+        { label: '200 EXTRA LIGHT', sample: 'const GLSL_VERSION = "#version 300 es";', font: '200 38px monospace' },
+        { label: '300 LIGHT', sample: 'function computeCurl(u, v, angle) {', font: '300 38px monospace' },
+        { label: '400 REGULAR', sample: 'let sinc = sin(theta) / theta;', font: '400 38px monospace' },
+        { label: '500 MEDIUM', sample: 'return beyondCurl * sinc * uBendAngle;', font: '500 38px monospace' },
+        { label: '600 SEMIBOLD', sample: 'vec3 sheetP = _computeSheetPosition(uv);', font: '600 38px monospace' },
+        { label: '700 BOLD', sample: 'objectNormal = normalize(surfaceNormal);', font: '700 38px monospace' },
+        { label: '800 EXTRA BOLD', sample: 'gl_FrontFacing ? frontColor : backColor;', font: '800 38px monospace' },
+        { label: '900 BLACK', sample: 'HIGH DENSITY MONOSPACED SPECIMEN', font: '900 38px monospace' }
+      ];
+
+      weights.forEach((w, i) => {
+        const y = 430 + i * 155;
+        ctx.fillStyle = '#2B6CE6';
+        ctx.font = 'bold 24px monospace';
+        ctx.fillText(w.label, 140, y);
+
+        ctx.fillStyle = '#0F0F11';
+        ctx.font = w.font;
+        ctx.fillText(w.sample, 140, y + 42);
+
+        ctx.strokeStyle = '#E2ECF7';
+        ctx.lineWidth = 1.5;
+        ctx.beginPath(); ctx.moveTo(140, y + 105); ctx.lineTo(CANVAS_W - 140, y + 105); ctx.stroke();
+      });
+    }
+
+    function renderPageLigatures(ctx) {
+      ctx.fillStyle = '#0F0F11';
+      ctx.font = 'bold 64px monospace';
+      ctx.fillText('03 / CODING LIGATURES', 140, 240);
+      ctx.fillStyle = '#2B6CE6';
+      ctx.font = 'bold 32px monospace';
+      ctx.fillText('OPENTYPE FEATURE: [calt] CONTEXTUAL ALTERNATES', 140, 320);
+
+      const ligatures = [
+        { orig: '===', desc: 'Strict Equality' },
+        { orig: '!==', desc: 'Strict Inequality' },
+        { orig: '=>',  desc: 'Arrow Function' },
+        { orig: '->',  desc: 'Pointer Return' },
+        { orig: '<!--',desc: 'XML/HTML Comment' },
+        { orig: '-->', desc: 'Comment Closer' },
+        { orig: '</>', desc: 'JSX Empty Tag' },
+        { orig: '::',  desc: 'Scope Resolution' },
+        { orig: '&&',  desc: 'Logical AND' },
+        { orig: '||',  desc: 'Logical OR' },
+        { orig: '..=', desc: 'Inclusive Range' },
+        { orig: '??',  desc: 'Nullish Coalescing' }
+      ];
+
+      ligatures.forEach((item, i) => {
+        const col = i % 3;
+        const row = Math.floor(i / 3);
+        const x = 140 + col * 520;
+        const y = 410 + row * 200;
+
+        ctx.fillStyle = '#F0F4FA';
+        ctx.fillRect(x, y, 480, 165);
+        ctx.strokeStyle = '#CFE0F5';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(x, y, 480, 165);
+
+        ctx.fillStyle = '#0F0F11';
+        ctx.font = 'bold 64px monospace';
+        ctx.fillText(item.orig, x + 35, y + 32);
+
+        ctx.fillStyle = '#444444';
+        ctx.font = 'bold 24px monospace';
+        ctx.fillText(item.desc, x + 35, y + 115);
+      });
+
+      const codeY = 1280;
+      ctx.fillStyle = '#18181B';
+      ctx.fillRect(140, codeY, CANVAS_W - 280, 560);
+      ctx.strokeStyle = '#2B6CE6';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(140, codeY, CANVAS_W - 280, 560);
+
+      ctx.fillStyle = '#E3EDFA';
+      ctx.font = 'bold 28px monospace';
+      ctx.fillText('// TYPICAL TYPESCRIPT / SHADER CODE SAMPLE', 180, codeY + 45);
+
+      const codeLines = [
+        { text: 'interface SheetPhysicsProps {', color: '#81ACEC' },
+        { text: '  progress: number;   // 0.0 => flat, 1.0 => turned', color: '#9CDCFE' },
+        { text: '  curlAngle: number;  // -35deg ... +35deg', color: '#9CDCFE' },
+        { text: '}', color: '#81ACEC' },
+        { text: '', color: '#fff' },
+        { text: 'const evaluateFold = (state: SheetPhysicsProps): boolean => {', color: '#DCDCAA' },
+        { text: '  if (state.progress !== 0.0 && state.progress <= 1.0) {', color: '#CE9178' },
+        { text: '    const theta = state.curlAngle * (Math.PI / 180);', color: '#B5CEA8' },
+        { text: '    return Math.abs(theta) >= 0.01;', color: '#CE9178' },
+        { text: '  }', color: '#DCDCAA' },
+        { text: '  return false;', color: '#C586C0' },
+        { text: '};', color: '#DCDCAA' }
+      ];
+
+      codeLines.forEach((cl, idx) => {
+        ctx.fillStyle = cl.color;
+        ctx.font = '32px monospace';
+        ctx.fillText(cl.text, 180, codeY + 105 + idx * 40);
+      });
+    }
+
+    function renderPageShader(ctx) {
+      ctx.fillStyle = '#0F0F11';
+      ctx.font = 'bold 64px monospace';
+      ctx.fillText('04 / SHADER PHYSICS', 140, 240);
+      ctx.fillStyle = '#2B6CE6';
+      ctx.font = 'bold 32px monospace';
+      ctx.fillText('CYLINDER SURFACE PROJECTION & SINC DEFORMATION', 140, 320);
+
+      ctx.fillStyle = '#0F0F11';
+      ctx.font = '32px monospace';
+      const intro = [
+        "The Paper.design curl effect is achieved via an analytic",
+        "closed-form cylinder fold in GLSL vertex shader.",
+        "A rotation fold vector uFold = (cos α, sin α) divides the sheet",
+        "into a flat resting zone and a cylindrical curved manifold."
+      ];
+      intro.forEach((l, i) => ctx.fillText(l, 140, 410 + i * 48));
+
+      ctx.fillStyle = '#F0F4FA';
+      ctx.fillRect(140, 630, CANVAS_W - 280, 240);
+      ctx.strokeStyle = '#CFE0F5';
+      ctx.strokeRect(140, 630, CANVAS_W - 280, 240);
+
+      ctx.fillStyle = '#0F0F11';
+      ctx.font = 'bold 34px monospace';
+      ctx.fillText('CYLINDER ARC INTEGRAL (SINC / VERSINE FORMULATION):', 180, 675);
+      ctx.fillStyle = '#2B6CE6';
+      ctx.font = 'bold 32px monospace';
+      ctx.fillText('sinc(θ)    = sin(θ) / θ         [when |θ| < 1e-4 -> 1.0]', 180, 740);
+      ctx.fillText('versine(θ) = (1.0 - cos(θ)) / θ [when |θ| < 1e-4 -> 0.0]', 180, 800);
+
+      const glslY = 930;
+      ctx.fillStyle = '#18181B';
+      ctx.fillRect(140, glslY, CANVAS_W - 280, 920);
+
+      ctx.fillStyle = '#81ACEC';
+      ctx.font = 'bold 28px monospace';
+      ctx.fillText('// CORE GLSL VERTEX TRANSFORM', 180, glslY + 45);
+
+      const glsl = [
+        "vec3 _computeSheetPosition(vec2 uv) {",
+        "    float localU = uv.x * uFold.x + (uv.y - 0.5) * SHEET_ASPECT * uFold.y;",
+        "    float localV = -uv.x * uFold.y + (uv.y - 0.5) * SHEET_ASPECT * uFold.x;",
+        "",
+        "    float beyondCurl = max(0.0, localU - uCurl.x);",
+        "    float curlNorm   = beyondCurl / uCurl.y;",
+        "    float cylinderAngle = curlNorm * uBendAngle;",
+        "",
+        "    float sinc    = abs(cylinderAngle) < 1e-4 ? 1.0 : sin(cylinderAngle) / cylinderAngle;",
+        "    float versine = abs(cylinderAngle) < 1e-4 ? 0.0 : (1.0 - cos(cylinderAngle)) / cylinderAngle;",
+        "",
+        "    float curvedLocal = beyondCurl * sinc;",
+        "    float curvedZ     = -uDirection * beyondCurl * versine;",
+        "    float curledU     = localU - beyondCurl + curvedLocal;",
+        "",
+        "    float px = curledU * uFold.x - localV * uFold.y;",
+        "    float py = curledU * uFold.y + localV * uFold.x;",
+        "    return vec3(px * uFlipRotation.x - curvedZ * uFlipRotation.y, py,",
+        "                px * uFlipRotation.y + curvedZ * uFlipRotation.x);",
+        "}"
+      ];
+
+      glsl.forEach((line, idx) => {
+        ctx.fillStyle = line.includes('//') ? '#6A9955' : (line.includes('float') || line.includes('vec3') ? '#4EC9B0' : '#D4D4D4');
+        ctx.font = '28px monospace';
+        ctx.fillText(line, 180, glslY + 105 + idx * 42);
+      });
+    }
+
+    function renderPageGlyphs(ctx) {
+      ctx.fillStyle = '#0F0F11';
+      ctx.font = 'bold 64px monospace';
+      ctx.fillText('05 / GLYPH MATRIX', 140, 240);
+      ctx.fillStyle = '#2B6CE6';
+      ctx.font = 'bold 32px monospace';
+      ctx.fillText('COMPLETE ASCII MATRIX (U+0020 .. U+007E)', 140, 320);
+
+      const startChar = 32;
+      const totalChars = 95;
+      const cols = 12;
+      const cellW = (CANVAS_W - 280) / cols;
+      const cellH = 145;
+
+      for (let i = 0; i < totalChars; i++) {
+        const charCode = startChar + i;
+        const charStr = String.fromCharCode(charCode);
+        const c = i % cols;
+        const r = Math.floor(i / cols);
+        const x = 140 + c * cellW;
+        const y = 410 + r * cellH;
+
+        ctx.strokeStyle = '#D4E2F2';
+        ctx.lineWidth = 1.5;
+        ctx.strokeRect(x, y, cellW, cellH);
+
+        ctx.fillStyle = '#2B6CE6';
+        ctx.font = 'bold 18px monospace';
+        ctx.fillText(`0x${charCode.toString(16).toUpperCase()}`, x + 10, y + 10);
+
+        ctx.fillStyle = '#0F0F11';
+        ctx.font = 'bold 50px monospace';
+        ctx.fillText(charStr, x + cellW / 2 - 16, y + 50);
+      }
+    }
+
+    function renderPageMetrics(ctx) {
+      ctx.fillStyle = '#0F0F11';
+      ctx.font = 'bold 64px monospace';
+      ctx.fillText('06 / METRICS & BLUEPRINT', 140, 240);
+      ctx.fillStyle = '#2B6CE6';
+      ctx.font = 'bold 32px monospace';
+      ctx.fillText('STRUCTURAL BLUEPRINT & CURVATURE RATIOS', 140, 320);
+
+      const drawLetter = (char, ox, oy) => {
+        ctx.strokeStyle = '#D1E1F5';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(ox, oy, 720, 800);
+
+        ctx.fillStyle = 'rgba(75, 139, 245, 0.08)';
+        ctx.fillRect(ox + 80, oy + 120, 560, 560);
+
+        ctx.fillStyle = '#0F0F11';
+        ctx.font = 'bold 500px monospace';
+        ctx.fillText(char, ox + 180, oy + 190);
+
+        ctx.strokeStyle = '#2B6CE6';
+        ctx.lineWidth = 3;
+        ctx.strokeRect(ox + 80, oy + 120, 560, 560);
+      };
+
+      drawLetter('R', 140, 420);
+      drawLetter('&', 900, 420);
+
+      const cardY = 1300;
+      ctx.fillStyle = '#F0F4FA';
+      ctx.fillRect(140, cardY, CANVAS_W - 280, 540);
+      ctx.strokeStyle = '#CFE0F5';
+      ctx.strokeRect(140, cardY, CANVAS_W - 280, 540);
+
+      ctx.fillStyle = '#0F0F11';
+      ctx.font = 'bold 32px monospace';
+      ctx.fillText('TECHNICAL RATIOS & OPTICAL CONSTANTS', 180, cardY + 50);
+
+      const ratios = [
+        "• CAP HEIGHT / X-HEIGHT RATIO: 1.385 (High readability on 4K & Retina screens)",
+        "• STEM THICKNESS (REGULAR): 84 UPM | STEM THICKNESS (BOLD): 146 UPM",
+        "• DIAGONAL STROKE THINNING: -12% on junctions (M, W, N, V)",
+        "• INK-TRAP DEPTH: 34 UPM at internal angle intersections",
+        "• PUNCTUATION SCALE FACTOR: 1.18× compared to standard body glyphs",
+        "• HIGH RESOLUTION CANVAS BUFFER: 1800 × 2478 px with 1:1 Bilinear Filtering"
+      ];
+      ratios.forEach((r, idx) => {
+        ctx.fillStyle = '#333';
+        ctx.font = 'bold 26px monospace';
+        ctx.fillText(r, 180, cardY + 120 + idx * 62);
+      });
+    }
+
+    function renderPageMath(ctx) {
+      ctx.fillStyle = '#0F0F11';
+      ctx.font = 'bold 64px monospace';
+      ctx.fillText('07 / MATHEMATICS & LOGIC', 140, 240);
+      ctx.fillStyle = '#2B6CE6';
+      ctx.font = 'bold 32px monospace';
+      ctx.fillText('FORMAL LOGIC, CALCULUS & GREEK ALPHABET', 140, 320);
+
+      const mathSets = [
+        { title: "CALCULUS & ALGEBRA", items: ["∑", "∏", "∫", "∮", "∇", "∂", "√", "∛", "∞", "≈", "≠", "≤", "≥", "±", "×", "÷"] },
+        { title: "SET THEORY & LOGIC", items: ["∈", "∉", "∋", "⊂", "⊃", "⊆", "⊇", "∩", "∪", "∧", "∨", "¬", "⇒", "⇔", "∀", "∃"] },
+        { title: "GREEK LOWERCASE", items: ["α", "β", "γ", "δ", "ε", "ζ", "η", "θ", "ι", "κ", "λ", "μ", "ν", "ξ", "π", "ω"] },
+        { title: "GREEK UPPERCASE", items: ["Γ", "Δ", "Θ", "Λ", "Ξ", "Π", "Σ", "Υ", "Φ", "Ψ", "Ω", "α", "β", "ϕ", "ψ", "ω"] }
+      ];
+
+      mathSets.forEach((set, sIdx) => {
+        const sy = 410 + sIdx * 255;
+        ctx.fillStyle = '#2B6CE6';
+        ctx.font = 'bold 24px monospace';
+        ctx.fillText(set.title, 140, sy);
+
+        set.items.forEach((item, iIdx) => {
+          const ix = 140 + iIdx * 95;
+          const iy = sy + 38;
+          ctx.fillStyle = '#F4F7FC';
+          ctx.fillRect(ix, iy, 84, 105);
+          ctx.strokeStyle = '#D1DFF2';
+          ctx.strokeRect(ix, iy, 84, 105);
+
+          ctx.fillStyle = '#0F0F11';
+          ctx.font = 'bold 46px monospace';
+          ctx.fillText(item, ix + 24, iy + 26);
+        });
+      });
+
+      const eqY = 1460;
+      ctx.fillStyle = '#18181B';
+      ctx.fillRect(140, eqY, CANVAS_W - 280, 380);
+      ctx.strokeStyle = '#2B6CE6';
+      ctx.strokeRect(140, eqY, CANVAS_W - 280, 380);
+
+      ctx.fillStyle = '#E3EDFA';
+      ctx.font = 'bold 28px monospace';
+      ctx.fillText('// FORMULA TYPESETTING SPECIMEN', 180, eqY + 45);
+
+      const eqLines = [
+        "F(ω) = ∫_{-∞}^{+∞} f(t) · e^{-iωt} dt",
+        "∇ × B = μ₀ J + μ₀ ε₀ (∂E / ∂t)",
+        "lim_{θ -> 0} (sin θ / θ) = 1.0  =>  Cylinder Roll Continuity"
+      ];
+      eqLines.forEach((eq, idx) => {
+        ctx.fillStyle = '#9CDCFE';
+        ctx.font = '36px monospace';
+        ctx.fillText(eq, 180, eqY + 120 + idx * 78);
+      });
+    }
+
+    function renderPageTui(ctx) {
+      ctx.fillStyle = '#0F0F11';
+      ctx.font = 'bold 64px monospace';
+      ctx.fillText('08 / BOX DRAWING & TUI', 140, 240);
+      ctx.fillStyle = '#2B6CE6';
+      ctx.font = 'bold 32px monospace';
+      ctx.fillText('TEXT USER INTERFACE & TERMINAL GRAPHICS', 140, 320);
+
+      const tuiY = 410;
+      ctx.fillStyle = '#141416';
+      ctx.fillRect(140, tuiY, CANVAS_W - 280, 740);
+      ctx.strokeStyle = '#2B6CE6';
+      ctx.strokeRect(140, tuiY, CANVAS_W - 280, 740);
+
+      const terminalText = [
+        "┌── paper-cli v2.4.0 ───────────────────────────────────────────────┐",
+        "│ $ agy build --target=production --mode=webgl                      │",
+        "│                                                                   │",
+        "│ [1/4] Compiling WebGL shaders .......................... [ DONE ] │",
+        "│ [2/4] Generating high-resolution paper textures ........ [ DONE ] │",
+        "│ [3/4] Initializing cylinder roll deformation ........... [ DONE ] │",
+        "│ [4/4] Packing 12-page interactive specimen ............. [ DONE ] │",
+        "│                                                                   │",
+        "│ PASS  tests/curl_physics.test.ts (14 tests passed, 32ms)          │",
+        "│ PASS  tests/ligature_calt.test.ts (28 tests passed, 18ms)         │",
+        "│                                                                   │",
+        "│  Build complete in 42ms. Serving on http://localhost:8080/mono    │",
+        "└───────────────────────────────────────────────────────────────────┘"
+      ];
+
+      terminalText.forEach((l, idx) => {
+        ctx.fillStyle = idx === 1 ? '#DCDCAA' : (l.includes('DONE') || l.includes('PASS') ? '#4EC9B0' : '#CCCCCC');
+        ctx.font = '28px monospace';
+        ctx.fillText(l, 175, tuiY + 50 + idx * 48);
+      });
+
+      ctx.fillStyle = '#F0F4FA';
+      ctx.fillRect(140, 1200, CANVAS_W - 280, 640);
+      ctx.strokeStyle = '#CFE0F5';
+      ctx.strokeRect(140, 1200, CANVAS_W - 280, 640);
+
+      ctx.fillStyle = '#0F0F11';
+      ctx.font = 'bold 30px monospace';
+      ctx.fillText('DIRECTORY TREE RECONSTRUCTION', 180, 1245);
+
+      const tree = [
+        "paper-mono-specimen/",
+        "├── src/",
+        "│   ├── shaders/",
+        "│   │   ├── cylinder_roll.vert.glsl",
+        "│   │   └── double_faced_paper.frag.glsl",
+        "│   ├── engine/",
+        "│   │   ├── book_state_controller.ts",
+        "│   │   └── page_texture_cache.ts",
+        "│   └── ui/",
+        "│       └── header_navigation.ts",
+        "├── package.json",
+        "└── README.md"
+      ];
+      tree.forEach((t, idx) => {
+        ctx.fillStyle = t.endsWith('/') ? '#2B6CE6' : '#222';
+        ctx.font = 'bold 26px monospace';
+        ctx.fillText(t, 180, 1300 + idx * 45);
+      });
+    }
+
+    function renderPageScripts(ctx) {
+      ctx.fillStyle = '#0F0F11';
+      ctx.font = 'bold 64px monospace';
+      ctx.fillText('09 / WORLD SCRIPTS', 140, 240);
+      ctx.fillStyle = '#2B6CE6';
+      ctx.font = 'bold 32px monospace';
+      ctx.fillText('CYRILLIC & EXTENDED LATIN SCRIPTS', 140, 320);
+
+      ctx.fillStyle = '#2B6CE6';
+      ctx.font = 'bold 26px monospace';
+      ctx.fillText('CYRILLIC SPECIMEN (RUSSIAN / UKRAINIAN / BULGARIAN):', 140, 410);
+
+      ctx.fillStyle = '#0F0F11';
+      ctx.font = 'bold 40px monospace';
+      const cyrillic = [
+        "А Б В Г Д Е Ж З И Й К Л М Н О П Р С Т У Ф Х Ц Ч Ш Щ Ъ Ы Ь Э Ю Я",
+        "а б в г д е ж з и й к л м н о п р с т у ф х ц ч ш щ ъ ы ь э ю я"
+      ];
+      cyrillic.forEach((c, idx) => ctx.fillText(c, 140, 470 + idx * 65));
+
+      ctx.fillStyle = '#2B6CE6';
+      ctx.font = 'bold 26px monospace';
+      ctx.fillText('ACCENTED DIACRITICS & EXTENDED LATIN:', 140, 650);
+
+      ctx.fillStyle = '#0F0F11';
+      ctx.font = 'bold 36px monospace';
+      const diacritics = [
+        "À Á Â Ã Ä Å Æ Ç È É Ê Ë Ì Í Î Ï Ð Ñ Ò Ó Ô Õ Ö Ø Ù Ú Û Ü Ý Þ ß",
+        "à á â ã ä å æ ç è é ê ë ì í î ï ð ñ ò ó ô õ ö ø ù ú û ü ý þ ÿ"
+      ];
+      diacritics.forEach((d, idx) => ctx.fillText(d, 140, 710 + idx * 60));
+
+      const pangramY = 900;
+      ctx.fillStyle = '#F0F4FA';
+      ctx.fillRect(140, pangramY, CANVAS_W - 280, 940);
+      ctx.strokeStyle = '#CFE0F5';
+      ctx.strokeRect(140, pangramY, CANVAS_W - 280, 940);
+
+      ctx.fillStyle = '#0F0F11';
+      ctx.font = 'bold 30px monospace';
+      ctx.fillText('MULTILINGUAL PANGRAM SAMPLES', 180, pangramY + 45);
+
+      const pangrams = [
+        { lang: "GERMAN", text: "Franz jagt im komplett verwahrlosten Taxi quer durch Bayern." },
+        { lang: "FRENCH", text: "Portez ce vieux whisky au juge blond qui fume des cigares." },
+        { lang: "SPANISH", text: "El veloz murciélago hindú comía feliz cardillo y kiwi." },
+        { lang: "POLISH", text: "Jeźdźcy z północy ruszyli w głąb ciemnego gęstego lasu." },
+        { lang: "RUSSIAN", text: "Съешь же ещё этих мягких французских булок, да выпей чаю." },
+        { lang: "ENGLISH", text: "The quick brown fox jumps over the lazy sleeping dog." }
+      ];
+
+      pangrams.forEach((p, idx) => {
+        const y = pangramY + 115 + idx * 135;
+        ctx.fillStyle = '#2B6CE6';
+        ctx.font = 'bold 22px monospace';
+        ctx.fillText(`[ ${p.lang} ]`, 180, y);
+
+        ctx.fillStyle = '#0F0F11';
+        ctx.font = 'bold 28px monospace';
+        ctx.fillText(p.text, 180, y + 40);
+      });
+    }
+
+    function renderPageVariables(ctx) {
+      ctx.fillStyle = '#0F0F11';
+      ctx.font = 'bold 64px monospace';
+      ctx.fillText('10 / VARIABLE AXES', 140, 240);
+      ctx.fillStyle = '#2B6CE6';
+      ctx.font = 'bold 32px monospace';
+      ctx.fillText('MULTI-AXIS INTERPOLATION & STRESS TEST', 140, 320);
+
+      const axes = [
+        { name: "WEIGHT [wght]", range: "100 <===> 900", val: "CURRENT: 400" },
+        { name: "SLANT  [slnt]", range: "-12° <===> 0°",  val: "CURRENT: 0°" },
+        { name: "WIDTH  [wdth]", range: "85% <===> 115%", val: "CURRENT: 100%" }
+      ];
+      axes.forEach((ax, idx) => {
+        const x = 140 + idx * 520;
+        ctx.fillStyle = '#F0F4FA';
+        ctx.fillRect(x, 400, 480, 170);
+        ctx.strokeStyle = '#D1DFF2';
+        ctx.strokeRect(x, 400, 480, 170);
+
+        ctx.fillStyle = '#2B6CE6';
+        ctx.font = 'bold 26px monospace';
+        ctx.fillText(ax.name, x + 25, 435);
+        ctx.fillStyle = '#666';
+        ctx.font = '22px monospace';
+        ctx.fillText(ax.range, x + 25, 480);
+        ctx.fillStyle = '#0F0F11';
+        ctx.font = 'bold 24px monospace';
+        ctx.fillText(ax.val, x + 25, 525);
+      });
+
+      const steps = [
+        { pt: '54pt', font: 'bold 58px monospace', text: 'Pack my box with five dozen liquor jugs' },
+        { pt: '40pt', font: 'bold 44px monospace', text: 'Sphinx of black quartz, judge my vow' },
+        { pt: '30pt', font: '500 34px monospace', text: 'How quickly daft jumping zebras vex their masters' },
+        { pt: '24pt', font: '500 28px monospace', text: 'Bright vixens jump; dozy fowl quack. Quick zephyrs blow, vexing daft Jim.' },
+        { pt: '18pt', font: '400 22px monospace', text: 'Jackdaws love my big sphinx of quartz. The five boxing wizards jump quickly at dawn.' }
+      ];
+
+      steps.forEach((st, idx) => {
+        const y = 650 + idx * 175;
+        ctx.fillStyle = '#2B6CE6';
+        ctx.font = 'bold 22px monospace';
+        ctx.fillText(st.pt, 140, y);
+
+        ctx.fillStyle = '#0F0F11';
+        ctx.font = st.font;
+        ctx.fillText(st.text, 140, y + 44);
+
+        ctx.strokeStyle = '#E2ECF7';
+        ctx.beginPath(); ctx.moveTo(140, y + 115); ctx.lineTo(CANVAS_W - 140, y + 115); ctx.stroke();
+      });
+    }
+
+    function renderPageColophon(ctx) {
+      ctx.fillStyle = '#0F0F11';
+      ctx.font = 'bold 64px monospace';
+      ctx.fillText('11 / COLOPHON', 140, 240);
+      ctx.fillStyle = '#2B6CE6';
+      ctx.font = 'bold 32px monospace';
+      ctx.fillText('PAPER DESIGN INC. // ALL RIGHTS RESERVED', 140, 320);
+
+      ctx.strokeStyle = '#2B6CE6';
+      ctx.lineWidth = 4;
+      ctx.strokeRect(140, 420, CANVAS_W - 280, 500);
+
+      ctx.fillStyle = '#0F0F11';
+      ctx.font = 'bold 100px monospace';
+      ctx.fillText('PAPER.DESIGN', 200, 500);
+      ctx.fillStyle = '#2B6CE6';
+      ctx.font = 'bold 68px monospace';
+      ctx.fillText('MONO SPECIMEN EDITION', 200, 630);
+
+      ctx.fillStyle = '#444';
+      ctx.font = 'bold 30px monospace';
+      ctx.fillText('RELEASE: VER 2.4.0 — PRODUCTION STABLE', 200, 760);
+      ctx.fillText('RENDER ENGINE: THREE.JS + CUSTOM WEBGL ROLL SHADER', 200, 820);
+
+      const infoY = 1000;
+      ctx.fillStyle = '#F0F4FA';
+      ctx.fillRect(140, infoY, CANVAS_W - 280, 580);
+      ctx.strokeStyle = '#CFE0F5';
+      ctx.strokeRect(140, infoY, CANVAS_W - 280, 580);
+
+      ctx.fillStyle = '#0F0F11';
+      ctx.font = 'bold 32px monospace';
+      ctx.fillText('PROJECT CREDITS & ATTRIBUTION', 180, infoY + 50);
+
+      const credits = [
+        "• ORIGINAL CONCEPT: Paper.design (https://paper.design/mono)",
+        "• 3D SHADER RECONSTRUCTION: Closed-form Cylinder Roll Shader",
+        "• TYPOGRAPHY: Paper Mono Variable Specimen (100-900 wght)",
+        "• TEXTURE BUFFER: 1800 × 2478 px, Zero-Mipmap Bilinear Sharp",
+        "• BOOK MECHANICS: Complete Cover-to-Cover Flip & Smooth Settle",
+        "• CREATED AT: 2026 // DeepMind Advanced Agentic Coding"
+      ];
+      credits.forEach((cr, idx) => {
+        ctx.fillStyle = '#222';
+        ctx.font = 'bold 26px monospace';
+        ctx.fillText(cr, 180, infoY + 125 + idx * 65);
+      });
+
+      ctx.fillStyle = '#0F0F11';
+      ctx.font = 'bold 36px monospace';
+      ctx.fillText('END OF INNER SPECIMEN. FLIP TO CLOSE BOOK →', 140, 1750);
+    }
+
+    function renderCoverBack(ctx) {
+      ctx.fillStyle = '#F8F8F5';
+      ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+
+      ctx.strokeStyle = '#D1DDEE';
+      ctx.lineWidth = 3;
+      ctx.strokeRect(140, 140, CANVAS_W - 280, CANVAS_H - 280);
+
+      ctx.fillStyle = '#0F0F11';
+      ctx.font = 'bold 110px monospace';
+      ctx.fillText('PAPER.DESIGN', 200, 600);
+      ctx.fillStyle = '#2B6CE6';
+      ctx.font = 'bold 54px monospace';
+      ctx.fillText('MONO VARIABLE SPECIMEN', 200, 740);
+
+      ctx.fillStyle = '#333';
+      ctx.font = '32px monospace';
+      ctx.fillText('Published by Paper Design Labs, San Francisco.', 200, 860);
+      ctx.fillText('Distributed worldwide for digital designers and engineers.', 200, 915);
+
+      ctx.fillStyle = '#0F0F11';
+      let bx = 200;
+      for (let i = 0; i < 54; i++) {
+        const w = (i % 4 === 0) ? 12 : (i % 2 === 0 ? 6 : 3);
+        ctx.fillRect(bx, 1300, w, 150);
+        bx += w + 8;
+      }
+
+      ctx.font = 'bold 28px monospace';
+      ctx.fillStyle = '#555';
+      ctx.fillText('ISBN 978-0-PAPER-MONO-2026', 200, 1485);
+      ctx.fillText('ALL RIGHTS RESERVED © 2026', 200, 1535);
+
+      ctx.fillStyle = '#0F0F11';
+      ctx.font = 'bold 32px monospace';
+      ctx.fillText('← FLIP BACK TO REOPEN SPECIMEN', 200, 1800);
+    }
+
+    // --- 高清无损贴图 (零降采样、双线性原生过滤) ---
+    const pageTextures = [];
+    for (let i = 0; i < TOTAL_TEXTURES; i++) {
+      const canvas = renderPageCanvas(i);
+      const tex = new THREE.CanvasTexture(canvas);
+      tex.generateMipmaps = false;
+      tex.minFilter = THREE.LinearFilter;
+      tex.magFilter = THREE.LinearFilter;
+      tex.needsUpdate = true;
+      pageTextures.push(tex);
+    }
+
+    // --- Three.js 场景初始化 ---
+    const container = document.getElementById('canvas-container');
+    const scene = new THREE.Scene();
+
+    // 视角贴近：占满视口 88%-92% 高度
+    const camera = new THREE.PerspectiveCamera(32, container.clientWidth / container.clientHeight, 0.1, 10);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, powerPreference: "high-performance" });
+    renderer.setPixelRatio(window.devicePixelRatio || 1);
+    renderer.setSize(container.clientWidth, container.clientHeight);
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    container.appendChild(renderer.domElement);
+
+    // --- 纯净艺术微喷光照 (总光照强度严格归一化为 1.0，杜绝反光过曝与色差) ---
+    // 环境光提供 0.85 的基底均匀光，无死角高保真还原本色
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.85);
+    scene.add(ambientLight);
+
+    // 平行光提供 0.15 的微弱柔和自然立体感与阴影
+    const dirLight = new THREE.DirectionalLight(0xffffff, 0.20);
+    dirLight.position.set(0.6, 1.8, 3.2);
+    dirLight.castShadow = true;
+    dirLight.shadow.mapSize.width = 2048;
+    dirLight.shadow.mapSize.height = 2048;
+    dirLight.shadow.camera.near = 0.5;
+    dirLight.shadow.camera.far = 10;
+    dirLight.shadow.bias = -0.0003;
+    scene.add(dirLight);
+
+    // 隐形阴影接收面
+    const shadowPlaneGeo = new THREE.PlaneGeometry(10, 10);
+    const shadowPlaneMat = new THREE.ShadowMaterial({ opacity: 0.06 });
+    const shadowPlane = new THREE.Mesh(shadowPlaneGeo, shadowPlaneMat);
+    shadowPlane.position.set(0, 0, -0.015);
+    shadowPlane.receiveShadow = true;
+    scene.add(shadowPlane);
+
+    // 书本根容器
+    const bookGroup = new THREE.Group();
+    scene.add(bookGroup);
+
+    function updateCameraFrame() {
+      const aspect = container.clientWidth / container.clientHeight;
+      camera.aspect = aspect;
+      const targetHeight = SHEET_ASPECT / 0.88;
+      const targetWidth = 2.05 / 0.90;
+      const fovRad = (camera.fov * Math.PI) / 180;
+      const distV = (targetHeight / 2) / Math.tan(fovRad / 2);
+      const distH = (targetWidth / 2) / (Math.tan(fovRad / 2) * aspect);
+      camera.position.set(0, 0, Math.max(distV, distH, 2.15));
+      camera.updateProjectionMatrix();
+    }
+    updateCameraFrame();
+
+    // 哑光纸张材质 (roughness: 1.0, metalness: 0.0，杜绝任何高光塑料反光)
+    const leftGeo = new THREE.PlaneGeometry(1, SHEET_ASPECT, 16, 16);
+    const leftMat = new THREE.MeshStandardMaterial({
+      map: pageTextures[0],
+      roughness: 1.0,
+      metalness: 0.0
+    });
+    const leftMesh = new THREE.Mesh(leftGeo, leftMat);
+    leftMesh.position.set(-0.5, 0, 0);
+    leftMesh.receiveShadow = true;
+    bookGroup.add(leftMesh);
+
+    const rightGeo = new THREE.PlaneGeometry(1, SHEET_ASPECT, 16, 16);
+    const rightMat = new THREE.MeshStandardMaterial({
+      map: pageTextures[2],
+      roughness: 1.0,
+      metalness: 0.0
+    });
+    const rightMesh = new THREE.Mesh(rightGeo, rightMat);
+    rightMesh.position.set(0.5, 0, 0);
+    rightMesh.receiveShadow = true;
+    rightMesh.visible = false;
+    bookGroup.add(rightMesh);
+
+    // 翻页纸张 Mesh
+    const sheetGeo = new THREE.PlaneGeometry(1, SHEET_ASPECT, 64, 88);
+    sheetGeo.translate(0.5, 0, 0);
+
+    const sheetUniforms = {
+      uDirection:    { value: 1.0 },
+      uStackLift:    { value: 1.0 },
+      uFlipProgress: { value: 0.0 },
+      uWrinkleSide:  { value: -1.0 },
+      uBendAngle:    { value: 0.0 },
+      uFold:         { value: new THREE.Vector2(1.0, 0.0) },
+      uCurl:         { value: new THREE.Vector2(0.0, 1.0) },
+      uFlipRotation: { value: new THREE.Vector2(1.0, 0.0) },
+      uBackMap:      { value: pageTextures[1] }
+    };
+
+    const sheetMat = new THREE.MeshStandardMaterial({
+      map: pageTextures[0],
+      side: THREE.DoubleSide,
+      roughness: 1.0,
+      metalness: 0.0
+    });
+
+    let sheetShaderRef = null;
+    sheetMat.onBeforeCompile = (shader) => {
+      sheetShaderRef = shader;
+      Object.assign(shader.uniforms, sheetUniforms);
+
+      const customVertexPrefix = `
+        uniform float uFlipProgress;
+        uniform float uWrinkleSide;
+        uniform float uBendAngle;
+        uniform vec2  uFold;
+        uniform vec2  uCurl;
+        uniform vec2  uFlipRotation;
+        uniform float uDirection;
+        uniform float uStackLift;
+
+        varying vec2  vSheetUv;
+
+        const float SHEET_ASPECT     = 1.377;
+        const float NORMAL_EPSILON   = 0.03;
+        const float LIFT_MAX_X       = 0.14;
+        const float LIFT_MAX_Z       = 0.03;
+        const float LIFT_DIP_X       = 0.58;
+        const float LIFT_DIP_Z       = 0.025;
+        const float LIFT_MID_X       = 0.72;
+        const float LIFT_MID_Z       = 0.03;
+        const float LIFT_EDGE_Z      = 0.02;
+        const float PI               = 3.14159265;
+        const float HALF_PI          = 1.57079633;
+
+        vec3 _computeSheetPosition(vec2 uvCoord) {
+            float flatSheetX = uvCoord.x;
+            float flatSheetY = (uvCoord.y - 0.5) * SHEET_ASPECT;
+
+            float restingLift;
+            if (uvCoord.x <= LIFT_MAX_X) {
+                restingLift = LIFT_MAX_Z * sin(uvCoord.x / LIFT_MAX_X * HALF_PI);
+            } else if (uvCoord.x <= LIFT_DIP_X) {
+                restingLift = mix(LIFT_MAX_Z, LIFT_DIP_Z, smoothstep(LIFT_MAX_X, LIFT_DIP_X, uvCoord.x));
+            } else if (uvCoord.x <= LIFT_MID_X) {
+                restingLift = mix(LIFT_DIP_Z, LIFT_MID_Z, smoothstep(LIFT_DIP_X, LIFT_MID_X, uvCoord.x));
+            } else {
+                float t = (uvCoord.x - LIFT_MID_X) / (1.0 - LIFT_MID_X);
+                restingLift = mix(LIFT_MID_Z, LIFT_EDGE_Z, 1.0 - cos(t * HALF_PI));
+            }
+            restingLift *= uStackLift * (1.0 - sin(uFlipProgress * PI) * 0.7);
+
+            float cosFold = uFold.x;
+            float sinFold = uFold.y;
+            float localU =  flatSheetX * cosFold + flatSheetY * sinFold;
+            float localV = -flatSheetX * sinFold + flatSheetY * cosFold;
+
+            float curlStart  = uCurl.x;
+            float curlLength = uCurl.y;
+
+            float beyondCurl = max(0.0, localU - curlStart);
+            float curlNorm   = beyondCurl / curlLength;
+
+            float cylinderAngle = curlNorm * uBendAngle;
+            float sinc    = abs(cylinderAngle) < 1e-4 ? 1.0 : sin(cylinderAngle) / cylinderAngle;
+            float versine = abs(cylinderAngle) < 1e-4 ? 0.0 : (1.0 - cos(cylinderAngle)) / cylinderAngle;
+            
+            float curvedLocal = beyondCurl * sinc;
+            float curvedZ     = -uDirection * beyondCurl * versine;
+            float curledU     = localU - beyondCurl + curvedLocal;
+
+            float px = curledU * cosFold - localV * sinFold;
+            float py = curledU * sinFold + localV * cosFold;
+            float pz = curvedZ;
+
+            float cosRot = uFlipRotation.x;
+            float sinRot = uFlipRotation.y;
+
+            float x = px * cosRot - pz * sinRot;
+            float y = py;
+            float z = px * sinRot + pz * cosRot;
+
+            z += restingLift;
+            return vec3(x, y, z);
+        }
+
+        vec3 _transformedSheetPosition;
+      `;
+
+      shader.vertexShader = customVertexPrefix + shader.vertexShader;
+
+      // 静止时法线精确归一化为 (0,0,1)，彻底消除静止与翻动间的亮度色差突变
+      shader.vertexShader = shader.vertexShader.replace(
+        '#include <beginnormal_vertex>',
+        `
+        #include <beginnormal_vertex>
+        {
+            if (uFlipProgress < 0.0001 && abs(uBendAngle) < 0.0001) {
+                objectNormal = vec3(0.0, 0.0, 1.0);
+            } else {
+                float epsilon = NORMAL_EPSILON;
+                vec2 du = vec2(epsilon, epsilon / SHEET_ASPECT);
+                vec3 sheetP  = _computeSheetPosition(uv);
+                vec3 sheetPx = _computeSheetPosition(uv + vec2(du.x, 0.0));
+                vec3 sheetPy = _computeSheetPosition(uv + vec2(0.0, du.y));
+                vec3 surfaceNormal = normalize(cross(sheetPx - sheetP, sheetPy - sheetP));
+                objectNormal = surfaceNormal;
+            }
+            _transformedSheetPosition = _computeSheetPosition(uv);
+        }
+        `
+      );
+
+      shader.vertexShader = shader.vertexShader.replace(
+        '#include <begin_vertex>',
+        `
+        vec3 transformed = _transformedSheetPosition;
+        vSheetUv = uv;
+        `
+      );
+
+      // 片元着色器：纯正原版色彩，零透光重影
+      shader.fragmentShader = `
+        uniform sampler2D uBackMap;
+        varying vec2 vSheetUv;
+      ` + shader.fragmentShader;
+
+      shader.fragmentShader = shader.fragmentShader.replace(
+        '#include <map_fragment>',
+        `
+        #ifdef USE_MAP
+            vec2 flippedUv = vec2(1.0 - vSheetUv.x, vSheetUv.y);
+            vec4 frontColor = texture2D(map, vSheetUv);
+            vec4 backColor  = texture2D(uBackMap, flippedUv);
+            vec4 sheetColor = gl_FrontFacing ? frontColor : backColor;
+            diffuseColor = sheetColor;
+        #endif
+        `
+      );
+    };
+
+    const sheetMesh = new THREE.Mesh(sheetGeo, sheetMat);
+    sheetMesh.position.set(0, 0, 0.002);
+    sheetMesh.castShadow = true;
+    sheetMesh.receiveShadow = true;
+    bookGroup.add(sheetMesh);
+
+    // --- 翻页状态机与对齐控制 ---
+    let currentSpread = 0; // 0..7
+    let isFlippingBackward = false;
+    let targetBookX = -0.5;
+
+    const pageState = {
+      progress: 0.0,
+      targetProgress: 0.0,
+      curlAngleDeg: 0.0,
+      curlArc: 0.88,
+      direction: 1.0,
+      isDragging: false
+    };
+
+    function setSheetTextureMaps(frontTex, backTex) {
+      sheetMat.map = frontTex;
+      if (sheetShaderRef && sheetShaderRef.uniforms.map) {
+        sheetShaderRef.uniforms.map.value = frontTex;
+      }
+      sheetUniforms.uBackMap.value = backTex;
+    }
+
+    function updateSpreadTextures(spread, backwardTransition = false) {
+      if (!backwardTransition) {
+        if (spread === 0) {
+          leftMesh.visible = false;
+          rightMesh.visible = false;
+          sheetMesh.visible = true;
+          setSheetTextureMaps(pageTextures[0], pageTextures[1]);
+          targetBookX = -0.5;
+        } else if (spread === 7) {
+          leftMesh.visible = true;
+          leftMat.map = pageTextures[13];
+          leftMat.needsUpdate = true;
+          rightMesh.visible = false;
+          sheetMesh.visible = false;
+          targetBookX = 0.5;
+        } else {
+          leftMesh.visible = true;
+          const leftTexIdx = (spread - 1) * 2 + 1;
+          const rightTexIdx = (spread - 1) * 2 + 2;
+          const nextBackIdx = rightTexIdx + 1;
+          const nextRightIdx = rightTexIdx + 2;
+
+          leftMat.map = pageTextures[leftTexIdx];
+          leftMat.needsUpdate = true;
+
+          sheetMesh.visible = true;
+          setSheetTextureMaps(
+            pageTextures[rightTexIdx],
+            nextBackIdx < TOTAL_TEXTURES ? pageTextures[nextBackIdx] : pageTextures[13]
+          );
+
+          if (nextRightIdx < TOTAL_TEXTURES) {
+            rightMat.map = pageTextures[nextRightIdx];
+            rightMat.needsUpdate = true;
+          }
+          rightMesh.visible = false;
+          targetBookX = 0.0;
+        }
+      } else {
+        if (spread === 1) {
+          leftMesh.visible = false;
+          rightMesh.visible = true;
+          rightMat.map = pageTextures[2];
+          rightMat.needsUpdate = true;
+
+          sheetMesh.visible = true;
+          setSheetTextureMaps(pageTextures[0], pageTextures[1]);
+          targetBookX = -0.5;
+        } else if (spread === 7) {
+          leftMesh.visible = true;
+          leftMat.map = pageTextures[11];
+          leftMat.needsUpdate = true;
+
+          rightMesh.visible = false;
+          sheetMesh.visible = true;
+          setSheetTextureMaps(pageTextures[12], pageTextures[13]);
+          targetBookX = 0.0;
+        } else {
+          const prevSpread = spread - 1;
+          const prevLeftIdx = (prevSpread - 1) * 2 + 1;
+          const prevRightIdx = (prevSpread - 1) * 2 + 2;
+          const currLeftIdx = (spread - 1) * 2 + 1;
+          const currRightIdx = (spread - 1) * 2 + 2;
+
+          leftMesh.visible = true;
+          leftMat.map = pageTextures[prevLeftIdx];
+          leftMat.needsUpdate = true;
+
+          rightMesh.visible = true;
+          rightMat.map = pageTextures[currRightIdx];
+          rightMat.needsUpdate = true;
+
+          sheetMesh.visible = true;
+          setSheetTextureMaps(pageTextures[prevRightIdx], pageTextures[currLeftIdx]);
+          targetBookX = 0.0;
+        }
+      }
+    }
+
+    const pageIndicator = document.getElementById('page-indicator');
+    const btnPrev = document.getElementById('btn-prev');
+    const btnNext = document.getElementById('btn-next');
+
+    function updateUI() {
+      if (currentSpread === 0) {
+        pageIndicator.innerText = '[ 封面 · 合书 ]';
+        btnPrev.disabled = true;
+        btnPrev.innerText = '← 上一页';
+        btnNext.disabled = false;
+        btnNext.innerText = '翻开封面 →';
+      } else if (currentSpread === 7) {
+        pageIndicator.innerText = '[ 封底 · 合书 ]';
+        btnPrev.disabled = false;
+        btnPrev.innerText = '← 翻开封底';
+        btnNext.disabled = true;
+        btnNext.innerText = '下一页 →';
+      } else {
+        const p1 = (currentSpread - 1) * 2 + 1;
+        const p2 = (currentSpread - 1) * 2 + 2;
+        pageIndicator.innerText = `PAGE ${String(p1).padStart(2, '0')} - ${String(p2).padStart(2, '0')} / 12`;
+        btnPrev.disabled = false;
+        btnPrev.innerText = (currentSpread === 1) ? '← 合上封面' : '← 上一页';
+        btnNext.disabled = false;
+        btnNext.innerText = (currentSpread === 6) ? '合上封底 →' : '下一页 →';
+      }
+    }
+
+    updateSpreadTextures(currentSpread);
+    updateUI();
+
+    function flipNext() {
+      if (currentSpread >= TOTAL_SPREADS - 1) return;
+      if (pageState.isDragging) return;
+      isFlippingBackward = false;
+      updateSpreadTextures(currentSpread, false);
+      if (currentSpread >= 1 && currentSpread < 6) {
+        rightMesh.visible = true;
+      }
+      pageState.progress = 0.0;
+      pageState.targetProgress = 1.0;
+      pageState.curlAngleDeg = -14;
+    }
+
+    function flipPrev() {
+      if (currentSpread <= 0) return;
+      if (pageState.isDragging) return;
+      isFlippingBackward = true;
+      updateSpreadTextures(currentSpread, true);
+      pageState.progress = 1.0;
+      pageState.targetProgress = 0.0;
+      pageState.curlAngleDeg = 14;
+    }
+
+    btnNext.addEventListener('click', flipNext);
+    btnPrev.addEventListener('click', flipPrev);
+
+    window.addEventListener('keydown', (e) => {
+      if (e.key === 'ArrowRight' || e.key === 'PageDown' || e.key === ' ') {
+        flipNext();
+      } else if (e.key === 'ArrowLeft' || e.key === 'PageUp') {
+        flipPrev();
+      }
+    });
+
+    function updatePageDeformation(progress, angleDeg, arc) {
+      const angleRad = angleDeg * Math.PI / 180;
+      const s = Math.cos(angleRad);
+      const c = Math.sin(angleRad);
+
+      const u = 1 - 0.6885 * Math.sin(Math.abs(angleRad));
+      const d = 1 - u;
+      const f = 0.6885 * Math.sign(c);
+      const p = Math.max(0, s + c * f - d);
+
+      const n = progress * Math.PI;
+      const bendAngle = Math.sin(progress * Math.PI) * Math.PI * arc;
+      const h = (p / u) * bendAngle;
+      const g = n + 0.5 * pageState.direction * (p * (Math.abs(h) < 1e-4 ? 0 : (1 - Math.cos(h)) / h));
+
+      sheetUniforms.uFlipProgress.value = progress;
+      sheetUniforms.uWrinkleSide.value = -Math.cos(n);
+      sheetUniforms.uDirection.value = pageState.direction;
+      sheetUniforms.uStackLift.value = 1.0;
+      sheetUniforms.uBendAngle.value = bendAngle;
+      sheetUniforms.uFold.value.set(s, c);
+      sheetUniforms.uCurl.value.set(d, u);
+      sheetUniforms.uFlipRotation.value.set(Math.cos(g), Math.sin(g));
+    }
+
+    // --- 触控/鼠标交互 ---
+    let dragStartX = 0;
+    let dragStartY = 0;
+    let dragMode = null;
+    let hasMoved = false;
+
+    container.addEventListener('pointerdown', (e) => {
+      const rect = container.getBoundingClientRect();
+      const clickX = e.clientX - rect.left;
+      const isRightSide = clickX > rect.width * 0.5;
+
+      dragStartX = e.clientX;
+      dragStartY = e.clientY;
+      hasMoved = false;
+
+      if (currentSpread === 0) {
+        // 封面居中合书：点击/拖拽封面均可翻开
+        pageState.isDragging = true;
+        dragMode = 'forward';
+        isFlippingBackward = false;
+        updateSpreadTextures(currentSpread, false);
+        pageState.progress = 0.0;
+        pageState.targetProgress = 0.0;
+      } else if (currentSpread === TOTAL_SPREADS - 1) {
+        // 封底居中合书：点击/拖拽封底均可翻开
+        pageState.isDragging = true;
+        dragMode = 'backward';
+        isFlippingBackward = true;
+        updateSpreadTextures(currentSpread, true);
+        pageState.progress = 1.0;
+        pageState.targetProgress = 1.0;
+      } else if (isRightSide && currentSpread < TOTAL_SPREADS - 1) {
+        pageState.isDragging = true;
+        dragMode = 'forward';
+        isFlippingBackward = false;
+        updateSpreadTextures(currentSpread, false);
+        if (currentSpread >= 1 && currentSpread < 6) {
+          rightMesh.visible = true;
+        }
+        pageState.progress = 0.0;
+        pageState.targetProgress = 0.0;
+      } else if (!isRightSide && currentSpread > 0) {
+        pageState.isDragging = true;
+        dragMode = 'backward';
+        isFlippingBackward = true;
+        updateSpreadTextures(currentSpread, true);
+        pageState.progress = 1.0;
+        pageState.targetProgress = 1.0;
+      } else {
+        dragMode = null;
+      }
+
+      if (dragMode) {
+        const relativeY = (e.clientY - rect.top) / rect.height - 0.5;
+        pageState.curlAngleDeg = -relativeY * 42;
+      }
+    });
+
+    window.addEventListener('pointermove', (e) => {
+      // 悬停动态手势指示
+      if (!pageState.isDragging) {
+        const rect = container.getBoundingClientRect();
+        const isRight = (e.clientX - rect.left) > rect.width * 0.5;
+        if (currentSpread === 0 || currentSpread === TOTAL_SPREADS - 1) {
+          container.style.cursor = 'pointer';
+        } else if (isRight && currentSpread < TOTAL_SPREADS - 1) {
+          container.style.cursor = 'pointer';
+        } else if (!isRight && currentSpread > 0) {
+          container.style.cursor = 'pointer';
+        } else {
+          container.style.cursor = 'default';
+        }
+        return;
+      }
+
+      if (!dragMode) return;
+      const dist = Math.hypot(e.clientX - dragStartX, e.clientY - dragStartY);
+      if (dist > 8) hasMoved = true;
+
+      const rect = container.getBoundingClientRect();
+      const relativeY = (e.clientY - rect.top) / rect.height - 0.5;
+      pageState.curlAngleDeg = -relativeY * 42;
+
+      if (dragMode === 'forward') {
+        const dx = (dragStartX - e.clientX) / (container.clientWidth * 0.42);
+        pageState.targetProgress = Math.max(0, Math.min(1, dx));
+      } else if (dragMode === 'backward') {
+        const dx = (e.clientX - dragStartX) / (container.clientWidth * 0.42);
+        pageState.targetProgress = Math.max(0, Math.min(1, 1.0 - dx));
+      }
+    });
+
+    window.addEventListener('pointerup', (e) => {
+      if (!pageState.isDragging) return;
+      pageState.isDragging = false;
+
+      if (!hasMoved) {
+        if (currentSpread === 0) {
+          flipNext();
+        } else if (currentSpread === TOTAL_SPREADS - 1) {
+          flipPrev();
+        } else {
+          const rect = container.getBoundingClientRect();
+          const clickX = e.clientX - rect.left;
+          if (clickX > rect.width * 0.5) {
+            flipNext();
+          } else {
+            flipPrev();
+          }
+        }
+        return;
+      }
+
+      if (dragMode === 'forward') {
+        if (pageState.progress > 0.38) {
+          pageState.targetProgress = 1.0;
+        } else {
+          pageState.targetProgress = 0.0;
+        }
+      } else if (dragMode === 'backward') {
+        if (pageState.progress < 0.62) {
+          pageState.targetProgress = 0.0;
+        } else {
+          pageState.targetProgress = 1.0;
+        }
+      }
+    });
+
+    window.addEventListener('resize', () => {
+      updateCameraFrame();
+      renderer.setSize(container.clientWidth, container.clientHeight);
+    });
+
+    // --- 动画主循环 ---
+    function animate() {
+      requestAnimationFrame(animate);
+
+      // 书本合书/展开居中滑动
+      bookGroup.position.x += (targetBookX - bookGroup.position.x) * 0.1;
+
+      // 翻页进度弹簧插值
+      pageState.progress += (pageState.targetProgress - pageState.progress) * 0.15;
+
+      // 角度平滑回正
+      if (!pageState.isDragging) {
+        pageState.curlAngleDeg += (0 - pageState.curlAngleDeg) * 0.1;
+      }
+
+      // 状态推进与完成判断
+      if (!pageState.isDragging) {
+        if (!isFlippingBackward) {
+          if (pageState.targetProgress === 1.0 && pageState.progress >= 0.995) {
+            currentSpread++;
+            pageState.progress = 0.0;
+            pageState.targetProgress = 0.0;
+            pageState.curlAngleDeg = 0;
+            updateSpreadTextures(currentSpread, false);
+            updateUI();
+          }
+        } else {
+          if (pageState.targetProgress === 0.0 && pageState.progress <= 0.005) {
+            currentSpread--;
+            pageState.progress = 0.0;
+            pageState.targetProgress = 0.0;
+            pageState.curlAngleDeg = 0;
+            isFlippingBackward = false;
+            updateSpreadTextures(currentSpread, false);
+            updateUI();
+          } else if (pageState.targetProgress === 1.0 && pageState.progress >= 0.995) {
+            pageState.progress = 0.0;
+            pageState.targetProgress = 0.0;
+            pageState.curlAngleDeg = 0;
+            isFlippingBackward = false;
+            updateSpreadTextures(currentSpread, false);
+            updateUI();
+          }
+        }
+      }
+
+      updatePageDeformation(pageState.progress, pageState.curlAngleDeg, pageState.curlArc);
+      renderer.render(scene, camera);
+    }
+    animate();
+  </script>
+</body>
+</html>
